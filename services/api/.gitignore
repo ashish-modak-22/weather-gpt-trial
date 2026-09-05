@@ -1,0 +1,5 @@
+node_modules
+.env
+.env.production
+/src/generated/prisma
+.DS_Store
