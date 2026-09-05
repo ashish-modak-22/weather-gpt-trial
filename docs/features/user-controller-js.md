@@ -18,142 +18,225 @@ import adminAuth from "../config/firebase.js";
 
 ---
 
-## 1. `registerUser`
+## File Interlink Diagram
 
-**Route:** `POST /register` (protected by `verifyFirebaseToken`)
+This shows how `user.controller.js` sits in the middle of the request flow and which files it depends on.
 
-- Runs **after** the client has already created a Firebase account and signed in — the frontend sends the Firebase ID token, which `verifyFirebaseToken` middleware decodes into `req.firebaseUser`.
-- Pulls `uid` and `email` from the decoded Firebase token, and `userName` / `fullName` from the request body.
-- Validates that `userName` and `fullName` were provided.
-- Checks Mongo to make sure this Firebase UID hasn't already been registered (prevents duplicate profiles).
-- Creates the Mongo `User` document, copying `email_verified` from the Firebase token into `isVerified`.
-- Responds `201 Created` with the new user.
+```mermaid
+graph TD
+    A[server.js] --> B[app.js]
+    B --> C[routes/user.route.js]
+    C --> D[middleware/verifyFirebaseToken.js]
+    D --> E[config/firebase.js<br/>adminAuth]
+    C --> F[controllers/user.controller.js]
 
----
+    F --> E
+    F --> G[models/user.model.js<br/>User]
+    F --> H[utils/Async.js<br/>ApiResponse / ApiError]
+    F --> I[utils/asyncHandler.js<br/>asyncHandler]
 
-## 2. `getCurrentUser`
+    G --> J[(MongoDB)]
+    E --> K[(Firebase Auth)]
 
-**Route:** `GET /me` (protected)
+    style F fill:#4a90d9,color:#fff
+    style E fill:#e8a33d,color:#fff
+    style G fill:#5cb85c,color:#fff
+```
 
-- Looks up the Mongo profile matching the currently authenticated Firebase UID.
-- If no profile exists, throws a `404` (this can happen if someone has a valid Firebase account but never completed `/register`).
-- Returns the profile with `200 OK`.
-
----
-
-## 3. `loginUser`
-
-**Route:** `POST /login` (protected)
-
-Firebase itself already verifies the password on the frontend — this endpoint's job is just to **sync app-side state** after that login succeeds.
-
-- Extracts `uid` and `email_verified` from the decoded token.
-- Fetches the matching Mongo profile. If it doesn't exist, throws `404` (user must register first).
-- If Mongo's `isVerified` is out of sync with Firebase's `email_verified`, updates and saves it — this keeps your DB accurate if the user verified their email after registering.
-- Returns the profile with `200 OK`.
+**Reading this diagram:**
+- `server.js` boots the app and connects to MongoDB, then hands off to `app.js`.
+- `app.js` mounts `user.route.js` under `/api/v1/auth`.
+- Protected routes first pass through `verifyFirebaseToken` middleware, which uses `adminAuth` (from `config/firebase.js`) to decode the incoming ID token into `req.firebaseUser`.
+- The controller itself talks to **two systems**: `adminAuth` (Firebase — identity/auth operations) and `User` model (MongoDB — app profile data).
+- `Async.js` and `asyncHandler.js` are cross-cutting utilities used by almost every handler.
 
 ---
 
-## 4. `logoutUser`
+## Request Flow — Protected Route (e.g. `/me`, `/update-profile`)
 
-**Route:** `POST /logout` (protected)
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Route as user.route.js
+    participant MW as verifyFirebaseToken
+    participant Firebase as adminAuth (Firebase)
+    participant Ctrl as user.controller.js
+    participant DB as MongoDB (User model)
 
-- Calls `adminAuth.revokeRefreshTokens(uid)`.
-- This invalidates all existing Firebase refresh tokens for that user, meaning any ID token minted after this point using an old refresh token will fail — effectively force-logging-out the user everywhere.
-- Note: it does **not** invalidate the current ID token immediately (those are valid until they naturally expire, usually within 1 hour), which is a normal limitation of Firebase.
+    Client->>Route: Request + Authorization: Bearer <idToken>
+    Route->>MW: verifyFirebaseToken(req, res, next)
+    MW->>Firebase: adminAuth.verifyIdToken(idToken)
+    Firebase-->>MW: decoded token (uid, email, email_verified)
+    MW->>MW: req.firebaseUser = decodedToken
+    MW->>Ctrl: next() → handler runs
+    Ctrl->>DB: findOne / findOneAndUpdate (firebaseUID)
+    DB-->>Ctrl: user document
+    Ctrl-->>Client: ApiResponse(200, user, message)
+```
 
----
-
-## 5. `refreshToken`
-
-**Route:** `POST /refresh-token` (public — no middleware, since the old ID token is likely expired)
-
-- Firebase Admin SDK **cannot** mint new ID tokens from a refresh token — that only works through Firebase's public **Secure Token API**.
-- Takes `refreshToken` from the request body.
-- Sends a `POST` request to `https://securetoken.googleapis.com/v1/token?key=<FIREBASE_API_KEY>` with `grant_type: refresh_token`.
-- If Firebase rejects it, throws `401`.
-- On success, returns the new `idToken`, `refreshToken`, and `expiresIn` to the client.
-
-> ⚠️ Requires a `FIREBASE_API_KEY` env variable — this is your Firebase **Web API key** (found in Firebase Console → Project Settings → General), **not** the Admin SDK service account credentials already used in `config/firebase.js`.
-
----
-
-## 6. `updateProfile`
-
-**Route:** `PATCH /update-profile` (protected)
-
-- Accepts optional `userName` and/or `fullName` in the body.
-- Throws `400` if neither is provided (nothing to update).
-- Builds a partial `$set` update object with only the provided fields.
-- Uses `findOneAndUpdate` with `{ new: true, runValidators: true }` so the response contains the updated doc and Mongoose schema validation still runs.
-- Throws `404` if the profile isn't found.
+If `verifyIdToken` fails (expired/invalid token), the middleware throws `ApiError(401)` and the controller never runs.
 
 ---
 
-## 7. `changePassword`
+## Workflow: `registerUser`
 
-**Route:** `PATCH /change-password` (protected)
+```mermaid
+sequenceDiagram
+    participant Client
+    participant MW as verifyFirebaseToken
+    participant Ctrl as registerUser
+    participant DB as MongoDB
 
-- Accepts `newPassword` from the body, validates a minimum length of 6 characters (Firebase's own minimum).
-- Calls `adminAuth.updateUser(uid, { password: newPassword })` to set the new password directly via Admin SDK.
-- **Important:** Admin SDK can't verify the *current* password — there's no "verify old password" step here. In production, the frontend should force the user to **reauthenticate** with Firebase (re-enter old password) right before calling this endpoint, so the ID token used to authorize this request is fresh.
-
----
-
-## 8. `forgotPassword`
-
-**Route:** `POST /forgot-password` (public)
-
-- Accepts an `email` in the body.
-- Calls `adminAuth.generatePasswordResetLink(email)`, which returns a Firebase-hosted reset link (with an embedded `oobCode`).
-- Currently just `console.log`s the link — **this is a placeholder**. In a real app you'd email this link to the user via a service like Nodemailer, SendGrid, etc.
-- Always responds `200 OK` with a generic message (avoid confirming/denying whether an email exists, to prevent user enumeration).
-
----
-
-## 9. `resetPassword`
-
-**Route:** `POST /reset-password` (public)
-
-- Accepts `oobCode` (the code embedded in the reset link the user clicked) and `newPassword`.
-- Calls Firebase's `accounts:resetPassword` REST endpoint (`identitytoolkit.googleapis.com`) with the code and new password.
-- Firebase validates the code server-side; if invalid/expired, responds with an error which is forwarded as `400`.
-- On success, the user's Firebase password is updated.
-
-> ⚠️ Also requires `FIREBASE_API_KEY`.
+    Client->>MW: POST /register + idToken + {userName, fullName}
+    MW-->>Ctrl: req.firebaseUser = {uid, email, email_verified}
+    Ctrl->>Ctrl: validate userName & fullName present
+    Ctrl->>DB: findOne({firebaseUID: uid})
+    alt already exists
+        DB-->>Ctrl: existing user
+        Ctrl-->>Client: 409 User already registered
+    else not found
+        DB-->>Ctrl: null
+        Ctrl->>DB: create({firebaseUID, email, userName, fullName, isVerified})
+        DB-->>Ctrl: new user
+        Ctrl-->>Client: 201 User registered
+    end
+```
 
 ---
 
-## 10. `verifyEmail`
+## Workflow: `loginUser`
 
-**Route:** `POST /verify-email` (public)
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Ctrl as loginUser
+    participant DB as MongoDB
 
-- Accepts `oobCode` (from the verification link Firebase emailed/generated).
-- Calls the `accounts:update` REST endpoint with the code — Firebase confirms the email associated with that code.
-- On success, Firebase returns the associated `email` in its response.
-- Updates the matching Mongo user's `isVerified` field to `true`, keeping the DB in sync with Firebase's verification state.
-
-> ⚠️ Also requires `FIREBASE_API_KEY`.
+    Client->>Ctrl: POST /login + idToken
+    Ctrl->>DB: findOne({firebaseUID: uid})
+    alt not found
+        DB-->>Ctrl: null
+        Ctrl-->>Client: 404 Register first
+    else found
+        DB-->>Ctrl: user
+        Ctrl->>Ctrl: compare user.isVerified vs token.email_verified
+        opt out of sync
+            Ctrl->>DB: user.save() with updated isVerified
+        end
+        Ctrl-->>Client: 200 Login successful
+    end
+```
 
 ---
 
-## 11. `resendVerificationEmail`
+## Workflow: `refreshToken` (public route)
 
-**Route:** `POST /resend-verification` (protected)
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Ctrl as refreshToken
+    participant STS as Google Secure Token API
 
-- Gets `email` from the authenticated user's decoded token.
-- Calls `adminAuth.generateEmailVerificationLink(email)` to get a fresh verification link.
-- Same placeholder pattern as `forgotPassword` — currently just logs the link; needs a real email service wired in.
+    Client->>Ctrl: POST /refresh-token + {refreshToken}
+    Ctrl->>STS: POST securetoken.googleapis.com/v1/token
+    alt invalid/expired
+        STS-->>Ctrl: error
+        Ctrl-->>Client: 401 Invalid refresh token
+    else valid
+        STS-->>Ctrl: {id_token, refresh_token, expires_in}
+        Ctrl-->>Client: 200 new tokens
+    end
+```
+
+Note: this bypasses `adminAuth` entirely — it talks directly to Firebase's public REST API since Admin SDK has no refresh-token exchange method.
 
 ---
 
-## 12. `deleteAccount`
+## Workflow: `forgotPassword` → `resetPassword`
 
-**Route:** `DELETE /delete-account` (protected)
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Forgot as forgotPassword
+    participant Firebase as adminAuth
+    participant Reset as resetPassword
+    participant IDT as Identity Toolkit REST API
+    participant Console as Server Console (placeholder)
 
-- Deletes the Mongo profile first (`findOneAndDelete`), throwing `404` if it doesn't exist.
-- Then deletes the actual Firebase user via `adminAuth.deleteUser(uid)`.
-- **Order matters here:** deleting Mongo first, then Firebase, avoids leaving an orphaned Firebase account if the Mongo deletion were to fail — you'd rather have a "ghost" Firebase user (recoverable) than a Firebase-less Mongo record pointing nowhere.
+    Client->>Forgot: POST /forgot-password + {email}
+    Forgot->>Firebase: generatePasswordResetLink(email)
+    Firebase-->>Forgot: resetLink (contains oobCode)
+    Forgot->>Console: console.log(resetLink)
+    Forgot-->>Client: 200 "Reset link sent" (generic message)
+
+    Note over Client,Console: In production, resetLink should be emailed,<br/>not logged.
+
+    Client->>Reset: POST /reset-password + {oobCode, newPassword}
+    Reset->>IDT: accounts:resetPassword {oobCode, newPassword}
+    alt invalid code
+        IDT-->>Reset: error
+        Reset-->>Client: 400 Invalid/expired code
+    else success
+        IDT-->>Reset: confirmation
+        Reset-->>Client: 200 Password reset successful
+    end
+```
+
+---
+
+## Workflow: `verifyEmail` / `resendVerificationEmail`
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Resend as resendVerificationEmail
+    participant Firebase as adminAuth
+    participant Verify as verifyEmail
+    participant IDT as Identity Toolkit REST API
+    participant DB as MongoDB
+
+    Client->>Resend: POST /resend-verification + idToken
+    Resend->>Firebase: generateEmailVerificationLink(email)
+    Firebase-->>Resend: verificationLink (contains oobCode)
+    Resend-->>Client: 200 "Verification email sent"
+
+    Client->>Verify: POST /verify-email + {oobCode}
+    Verify->>IDT: accounts:update {oobCode}
+    alt invalid code
+        IDT-->>Verify: error
+        Verify-->>Client: 400 Invalid/expired code
+    else success
+        IDT-->>Verify: {email}
+        Verify->>DB: findOneAndUpdate({email}, {isVerified: true})
+        Verify-->>Client: 200 Email verified successfully
+    end
+```
+
+---
+
+## Workflow: `deleteAccount`
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Ctrl as deleteAccount
+    participant DB as MongoDB
+    participant Firebase as adminAuth
+
+    Client->>Ctrl: DELETE /delete-account + idToken
+    Ctrl->>DB: findOneAndDelete({firebaseUID: uid})
+    alt not found
+        DB-->>Ctrl: null
+        Ctrl-->>Client: 404 Profile not found
+    else deleted
+        DB-->>Ctrl: deleted user doc
+        Ctrl->>Firebase: deleteUser(uid)
+        Firebase-->>Ctrl: confirmation
+        Ctrl-->>Client: 200 Account deleted successfully
+    end
+```
+
+**Why Mongo is deleted first:** if Mongo deletion fails, nothing has happened to Firebase yet (safe to retry). If Firebase deletion failed after Mongo succeeded, you'd have an orphaned Firebase account — recoverable manually — rather than a broken app record pointing to nothing.
 
 ---
 
@@ -170,6 +253,7 @@ Firebase itself already verifies the password on the frontend — this endpoint'
 ## Required Environment Variable To Add
 
 `FIREBASE_API_KEY=your-firebase-web-api-key`
+
 
 This is separate from `FIREBASE_PROJECT_ID` / `FIREBASE_CLIENT_EMAIL` / `FIREBASE_PRIVATE_KEY` already used in `config/firebase.js` (those are Admin SDK service account creds; `FIREBASE_API_KEY` is the public Web API key used for the REST-based token/reset/verify calls).
 
