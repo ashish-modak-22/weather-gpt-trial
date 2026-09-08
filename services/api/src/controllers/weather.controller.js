@@ -1,26 +1,13 @@
 import { ApiResponse, ApiError } from "../utils/Async.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
 import {
-    geocodeByCity,
-    geocodeByPincode,
-    reverseGeocode,
+    resolveLocation,
     fetchOneCall,
     extractCurrent,
     extractHourly,
     extractDaily,
     extractPrecipitation,
 } from "../services/weather.service.js";
-
-// resolve any {city|pincode|lat+lon} input into { lat, lon, name }
-const resolveLocation = async (query) => {
-    const { city, pincode, lat, lon } = query;
-
-    if (lat && lon) return reverseGeocode(lat, lon);
-    if (pincode) return geocodeByPincode(pincode, query.country || "IN");
-    if (city) return geocodeByCity(city, query.country || "IN");
-
-    throw new ApiError(400, "Provide city, pincode, or lat+lon");
-};
 
 // GET /current?city=|pincode=|lat=&lon=
 const getCurrentWeather = asyncHandler(async (req, res) => {
@@ -68,7 +55,10 @@ const searchLocation = asyncHandler(async (req, res) => {
 
     if (!query) throw new ApiError(400, "query is required");
 
-    const location = type === "pincode" ? await geocodeByPincode(query, country) : await geocodeByCity(query, country);
+    const location =
+        type === "pincode"
+            ? await resolveLocation({ pincode: query, country })
+            : await resolveLocation({ city: query, country });
 
     return res.status(200).json(new ApiResponse(200, location, "Location resolved"));
 });
@@ -79,7 +69,7 @@ const getWeatherByGPS = asyncHandler(async (req, res) => {
 
     if (!lat || !lon) throw new ApiError(400, "lat and lon are required");
 
-    const location = await reverseGeocode(lat, lon);
+    const location = await resolveLocation({ lat, lon });
     const oneCall = await fetchOneCall(lat, lon);
 
     return res.status(200).json(
