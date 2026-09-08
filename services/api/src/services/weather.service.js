@@ -44,6 +44,18 @@ const reverseGeocode = async (lat, lon) => {
     return { lat, lon, name: data[0].name, country: data[0].country };
 };
 
+// Shared across weather/rain/forecast-intelligence controllers:
+// resolve any {city|pincode|lat+lon} query into { lat, lon, name }
+const resolveLocation = async (query) => {
+    const { city, pincode, lat, lon } = query;
+
+    if (lat && lon) return reverseGeocode(lat, lon);
+    if (pincode) return geocodeByPincode(pincode, query.country || "IN");
+    if (city) return geocodeByCity(city, query.country || "IN");
+
+    throw new ApiError(400, "Provide city, pincode, or lat+lon");
+};
+
 // Free tier: current + 5-day/3-hour forecast, no subscription needed
 const fetchOneCall = async (lat, lon) => {
     const key = getApiKey();
@@ -120,6 +132,7 @@ export {
     geocodeByCity,
     geocodeByPincode,
     reverseGeocode,
+    resolveLocation,
     fetchOneCall,
     extractCurrent,
     extractHourly,
